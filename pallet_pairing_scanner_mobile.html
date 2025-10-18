@@ -518,7 +518,12 @@
                     }
                 },
                 // 這是新版 ZXing 的 constraints 參數（UMD 版支援）
-                { video: { facingMode: { ideal: 'environment' } } }
+                { 
+                    video: { 
+                        facingMode: { ideal: 'environment' },
+                        advanced: [{ focusMode: 'continuous' }]  // 啟用連續自動對焦
+                    } 
+                }
                 );
 
             } catch (error) {
