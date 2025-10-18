@@ -493,6 +493,8 @@
                 const hints = new Map();
                 hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
                 ZXing.BarcodeFormat.CODE_128, ZXing.BarcodeFormat.QR_CODE,
+                ZXing.BarcodeFormat.CODE_39, ZXing.BarcodeFormat.EAN_13,
+                ZXing.BarcodeFormat.UPC_A, 
                 ]);
                 codeReader = new ZXing.BrowserMultiFormatReader(hints, 500);
             }
