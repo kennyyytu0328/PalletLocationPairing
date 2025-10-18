@@ -488,42 +488,59 @@
         async function startScanner(targetInput) {
             currentTargetInput = targetInput;
             scannerContainer.style.display = 'flex';
-            
+
             if (!codeReader) {
                 const hints = new Map();
                 hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
-                    ZXing.BarcodeFormat.CODE_128,
-                    ZXing.BarcodeFormat.QR_CODE,
+                ZXing.BarcodeFormat.CODE_128, ZXing.BarcodeFormat.QR_CODE,
                 ]);
                 codeReader = new ZXing.BrowserMultiFormatReader(hints, 500);
             }
 
             try {
-                const deviceId = await getPreferredDeviceId();
-                if (!deviceId) {
-                    showStatus('找不到可用的相機。', 'error');
-                    closeScanner();
-                    return;
+                if (!window.isSecureContext) {
+                showStatus(`此頁面不在安全環境(HTTPS/localhost)。目前來源：${location.protocol}//${location.host}`, 'error');
+                closeScanner();
+                return;
                 }
 
-                await codeReader.decodeFromVideoDevice(deviceId, 'scanner-video', (result, err) => {
+                // 直接用 facingMode: environment，避免先 enumerateDevices
+                await codeReader.decodeFromVideoDevice(
+                null, // 讓 ZXing 自選裝置，我們用 constraints 指定
+                'scanner-video',
+                (result, err) => {
                     if (result) {
-                        currentTargetInput.value = result.getText();
-                        checkInputs();
-                        closeScanner();
+                    currentTargetInput.value = result.getText();
+                    checkInputs();
+                    closeScanner();
                     }
-                    if (err && !(err instanceof ZXing.NotFoundException)) {
-                        // 處理其他錯誤
-                    }
-                });
+                },
+                // 這是新版 ZXing 的 constraints 參數（UMD 版支援）
+                { video: { facingMode: { ideal: 'environment' } } }
+                );
 
             } catch (error) {
-                console.error('啟動相機錯誤:', error);
-                debugLog('❌ 相機啟動錯誤: ' + error.message);
-                showStatus('無法啟動相機,請檢查權限設定。file:// 協議無法使用相機,請改用 HTTP 伺服器。', 'error');
+                const name = error?.name || 'UnknownError';
+                const msg  = error?.message || '';
+                debugLog(`❌ 相機啟動錯誤: ${name} - ${msg}`);
+
+                // 依錯誤型別給出更精準的提示
+                let friendly = '無法啟動相機。';
+                if (name === 'NotAllowedError' || name === 'SecurityError') {
+                friendly = '相機權限被拒絕，請到瀏覽器的網站設定開啟相機權限再重試。';
+                } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+                friendly = '找不到可用的相機（或後鏡頭）。請確定裝置有相機，或移除外接相機占用。';
+                } else if (name === 'NotReadableError') {
+                friendly = '相機可能被其他 App 佔用，請關閉其它使用相機的 App 後再試。';
+                } else if (!window.isSecureContext) {
+                friendly = `此頁面不是 HTTPS/localhost（目前：${location.protocol}）。相機被瀏覽器封鎖。`;
+                }
+
+                showStatus(friendly, 'error');
                 closeScanner();
             }
         }
+
         
         function closeScanner() {
             if (codeReader) {
