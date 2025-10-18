@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>棧板儲位配對掃描 App</title>
+    <!-- 載入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 載入 Icon (Lucide Icons) -->
+    <script src="https://unpkg.com/lucide/dist/umd/lucide.js"></script>
+    
+    <!-- 載入 Firebase SDK (使用 compat 版本,支援 file:// 協議) -->
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+    
+    <!-- 載入 ZXing (使用 UMD 版本) -->
+    <script src="https://unpkg.com/@zxing/library@0.20.0/umd/index.min.js"></script>
+    
+    <style>
+        /* 使用系統字體以避免載入問題 */
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans TC', sans-serif; 
+            background-color: #f7f9fb; 
+        }
+        .card { box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1); }
+        .scan-btn { transition: all 0.15s ease; }
+        .scan-btn:hover { background-color: #f0f0f0; }
+        
+        /* 隱藏 ZXing 視訊串流，直到啟用 */
+        #scanner-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.9);
+            z-index: 50;
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        #scanner-video {
+            max-width: 90vw;
+            max-height: 80vh;
+            border: 4px solid #3b82f6;
+            border-radius: 8px;
+        }
+        
+        /* 確認刪除視窗樣式 */
+        #confirm-dialog {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 60;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* 認證門控層 */
+        #auth-gate {
+            display: flex;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #f7f9fb;
+            z-index: 70;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        /* 錯誤訊息區（極小版浮動視窗，只顯示一行） */
+        #debug-info {
+            position: fixed;
+            bottom: 10px;
+            left: 10px;
+            /* 在桌面上固定寬度，行動裝置則為視窗寬度的減邊距 */
+            width: 360px;
+            max-width: calc(100% - 20px);
+            background: rgba(0,0,0,0.9);
+            color: #fff;
+            padding: 4px 6px;
+            font-size: 9px;
+            max-height: 20px; /* 只顯示一行訊息的高度 */
+            overflow-y: auto;
+            display: none;
+            z-index: 100;
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            line-height: 1.2;
+        }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+
+    <!-- Debug 資訊區 (用於診斷問題) -->
+    <div id="debug-info"></div>
+
+    <!-- 認證門控：在輸入正確密碼前，應用程式不會初始化 -->
+    <div id="auth-gate">
+        <div class="card bg-white p-6 rounded-xl shadow-lg max-w-xs w-full text-center">
+            <h3 class="text-xl font-bold text-indigo-600 mb-4">存取驗證</h3>
+            <p class="text-gray-600 mb-4 text-sm">請輸入共享密碼以開始掃描作業：</p>
+            <input type="password" id="access-password" placeholder="請輸入密碼" aria-label="存取密碼" class="w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-center mb-4">
+            <button id="auth-submit-btn" class="w-full bg-indigo-600 text-white font-semibold py-2 rounded-xl hover:bg-indigo-700 transition duration-150">
+                進入應用程式
+            </button>
+            <p id="auth-error-msg" class="text-red-500 text-sm mt-3 hidden">密碼錯誤,請再試一次。</p>
+            <p class="text-xs text-gray-400 mt-3">📱 適用於本地檔案模式</p>
+        </div>
+    </div>
+    
+    <div class="max-w-4xl mx-auto hidden" id="main-app-content">
+        <header class="text-center mb-6">
+            <h1 class="text-3xl font-bold text-gray-800 flex items-center justify-center">
+                <i data-lucide="scan-line" class="w-8 h-8 mr-2 text-indigo-600"></i>
+                棧板/儲位配對掃描器
+            </h1>
+            <p class="text-sm text-gray-500 mt-1">即時配對與紀錄追蹤 (Logged in as: <span id="user-display" class="font-mono text-xs text-indigo-500">Loading...</span>)</p>
+        </header>
+
+        <!-- 掃描與輸入卡片 -->
+        <div class="card bg-white p-5 rounded-xl mb-6 border border-indigo-200">
+            <h2 class="text-xl font-semibold mb-4 text-gray-700">1. 輸入/掃描條碼</h2>
+            
+            <div id="status-message" class="hidden p-3 mb-4 rounded-lg text-sm font-medium" role="alert"></div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                
+                <!-- 棧板 ID 輸入區 -->
+                <div>
+                    <label for="pallet-id" class="block text-sm font-medium text-gray-700 mb-1">棧板 ID (Pallet ID)</label>
+                    <div class="flex space-x-2">
+                        <input type="text" id="pallet-id" placeholder="請輸入或掃描棧板條碼" class="flex-grow p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <button id="scan-pallet-btn" class="scan-btn bg-indigo-50 border border-indigo-300 text-indigo-700 p-2 rounded-lg hover:bg-indigo-100 flex items-center justify-center w-1/4">
+                            <i data-lucide="camera" class="w-5 h-5"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 儲位 ID 輸入區 -->
+                <div>
+                    <label for="location-id" class="block text-sm font-medium text-gray-700 mb-1">儲位 ID (Location ID)</label>
+                    <div class="flex space-x-2">
+                        <input type="text" id="location-id" placeholder="請輸入或掃描儲位條碼" class="flex-grow p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500">
+                        <button id="scan-location-btn" class="scan-btn bg-indigo-50 border border-indigo-300 text-indigo-700 p-2 rounded-lg hover:bg-indigo-100 flex items-center justify-center w-1/4">
+                            <i data-lucide="camera" class="w-5 h-5"></i>
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+            
+            <button id="save-pairing-btn" disabled class="mt-5 w-full bg-indigo-600 text-white font-semibold py-3 rounded-xl hover:bg-indigo-700 transition duration-150 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center">
+                <i data-lucide="save" class="w-5 h-5 mr-2"></i>
+                儲存配對
+            </button>
+        </div>
+
+        <!-- 紀錄列表與匯出卡片 -->
+        <div class="card bg-white p-5 rounded-xl border border-gray-200">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-xl font-semibold text-gray-700">2. 最近配對紀錄</h2>
+                <button id="export-csv-btn" class="bg-emerald-500 text-white font-medium text-sm py-2 px-4 rounded-lg hover:bg-emerald-600 transition flex items-center">
+                    <i data-lucide="download" class="w-4 h-4 mr-1"></i>
+                    匯出 CSV
+                </button>
+            </div>
+            
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">棧板 ID</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">儲位 ID</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden sm:table-cell">時間</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider hidden md:table-cell">掃描者</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pairing-list" class="bg-white divide-y divide-gray-200">
+                        <!-- 紀錄將由 JavaScript 渲染到此 -->
+                        <tr class="text-gray-500"><td colspan="5" class="py-4 text-center">載入中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- 掃描器視圖容器 (隱藏) -->
+    <div id="scanner-container">
+        <video id="scanner-video" playsinline></video>
+        <div class="mt-4 text-white text-lg font-medium">請將條碼對準鏡頭</div>
+        <button id="close-scanner-btn" class="mt-4 bg-red-600 text-white py-2 px-5 rounded-lg hover:bg-red-700">
+            <i data-lucide="x" class="w-5 h-5 inline mr-1"></i>
+            關閉
+        </button>
+    </div>
+
+    <!-- 刪除確認對話框 (隱藏) -->
+    <div id="confirm-dialog">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full">
+            <h3 class="text-xl font-bold text-gray-800 mb-3">確認刪除</h3>
+            <p class="text-gray-600 mb-5">您確定要刪除這筆配對紀錄嗎？此操作無法復原。</p>
+            <div class="flex justify-end space-x-3">
+                <button id="cancel-delete-btn" class="bg-gray-200 text-gray-700 font-medium py-2 px-4 rounded-lg hover:bg-gray-300">
+                    取消
+                </button>
+                <button id="confirm-delete-btn" data-doc-id="" class="bg-red-600 text-white font-medium py-2 px-4 rounded-lg hover:bg-red-700">
+                    確定刪除
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 主要 JavaScript 程式碼 (不使用 ES Modules) -->
+    <script>
+        // Debug 輔助函數
+        function debugLog(msg) {
+            const debugDiv = document.getElementById('debug-info');
+            const time = new Date().toLocaleTimeString('zh-TW');
+            debugDiv.innerHTML += `[${time}] ${msg}<br>`;
+            debugDiv.style.display = 'block';
+            console.log(msg);
+        }
+
+        // 檢查必要的函式庫是否載入
+        if (typeof firebase === 'undefined') {
+            debugLog('❌ Firebase 未載入');
+            alert('Firebase 未載入,請確保有網路連線');
+        } else {
+            debugLog('✅ Firebase 已載入');
+        }
+
+        if (typeof ZXing === 'undefined') {
+            debugLog('❌ ZXing 未載入');
+        } else {
+            debugLog('✅ ZXing 已載入');
+        }
+
+        // ======================================================================
+        // Firebase 配置
+        // ======================================================================
+        const firebaseConfig = {
+            apiKey: "AIzaSyC9Yu2pcNXsBdd3ShKh3clA9ZW1ZFKXslI",
+            authDomain: "cp-vituralstoragemapping.firebaseapp.com",
+            projectId: "cp-vituralstoragemapping",
+            storageBucket: "cp-vituralstoragemapping.firebasestorage.app",
+            messagingSenderId: "118873972527",
+            appId: "1:118873972527:web:726a565d3bc9bffd068bda"
+        };
+
+        const appId = 'my-company-pallet-scanner-v1'; 
+        const ACCESS_PASSWORD = '666666';
+        // ======================================================================
+
+        let app;
+        let db;
+        let auth;
+        let userId = null;
+
+        // UI 元素
+        const mainAppContent = document.getElementById('main-app-content');
+        const authGate = document.getElementById('auth-gate');
+        const authPasswordInput = document.getElementById('access-password');
+        let authUsernameInput = null;
+        const authSubmitBtn = document.getElementById('auth-submit-btn');
+        const authErrorMsg = document.getElementById('auth-error-msg');
+
+        const palletIdInput = document.getElementById('pallet-id');
+        const locationIdInput = document.getElementById('location-id');
+        const saveBtn = document.getElementById('save-pairing-btn');
+        const statusMessage = document.getElementById('status-message');
+        const pairingList = document.getElementById('pairing-list');
+        const userDisplay = document.getElementById('user-display');
+        const confirmDialog = document.getElementById('confirm-dialog');
+        const confirmDeleteBtn = document.getElementById('confirm-delete-btn');
+        const cancelDeleteBtn = document.getElementById('cancel-delete-btn');
+        
+        // 掃描相關
+        const scannerContainer = document.getElementById('scanner-container');
+        const videoElement = document.getElementById('scanner-video');
+        const closeScannerBtn = document.getElementById('close-scanner-btn');
+        let codeReader = null;
+        let currentTargetInput = null;
+
+        // --- 輔助函數 ---
+
+        function showStatus(message, type = 'success') {
+            statusMessage.textContent = message;
+            statusMessage.className = 'p-3 mb-4 rounded-lg text-sm font-medium';
+            statusMessage.classList.remove('hidden', 'bg-red-100', 'text-red-800', 'bg-green-100', 'text-green-800', 'bg-yellow-100', 'text-yellow-800');
+
+            if (type === 'error') {
+                statusMessage.classList.add('bg-red-100', 'text-red-800');
+            } else if (type === 'warning') {
+                statusMessage.classList.add('bg-yellow-100', 'text-yellow-800');
+            } else {
+                statusMessage.classList.add('bg-green-100', 'text-green-800');
+            }
+            statusMessage.classList.remove('hidden');
+            setTimeout(() => {
+                statusMessage.classList.add('hidden');
+            }, 5000);
+        }
+
+        function checkInputs() {
+            const palletId = palletIdInput.value.trim();
+            const locationId = locationIdInput.value.trim();
+            saveBtn.disabled = !(palletId && locationId);
+        }
+
+        function formatTimestamp(timestamp) {
+            if (timestamp && timestamp.toDate) {
+                return timestamp.toDate().toLocaleString('zh-TW', {
+                    hour: '2-digit', minute: '2-digit', second: '2-digit', month: '2-digit', day: '2-digit'
+                });
+            }
+            return 'N/A';
+        }
+
+        // --- Firestore 數據操作與即時監聽 ---
+
+        function getCollectionRef() {
+            return db.collection('artifacts').doc(appId).collection('public').doc('data').collection('pallet_pairings');
+        }
+
+        async function savePalletPairing() {
+            if (!userId) {
+                showStatus('認證尚未準備好,請稍候。', 'error');
+                return;
+            }
+
+            const palletId = palletIdInput.value.trim();
+            const locationId = locationIdInput.value.trim();
+
+            if (!palletId || !locationId) {
+                showStatus('請填寫棧板 ID 和儲位 ID。', 'warning');
+                return;
+            }
+
+            try {
+                saveBtn.disabled = true;
+                saveBtn.textContent = '儲存中...';
+
+                await getCollectionRef().add({
+                    palletId: palletId,
+                    locationId: locationId,
+                    userId: userId,
+                    timestamp: firebase.firestore.FieldValue.serverTimestamp()
+                });
+
+                showStatus('配對紀錄儲存成功！', 'success');
+                palletIdInput.value = '';
+                locationIdInput.value = '';
+                checkInputs();
+            } catch (error) {
+                console.error("儲存配對錯誤:", error);
+                debugLog('❌ 儲存錯誤: ' + error.message);
+                showStatus('儲存配對失敗,請檢查網路。', 'error');
+            } finally {
+                saveBtn.textContent = '儲存配對';
+                saveBtn.disabled = false;
+            }
+        }
+        
+        async function deletePalletPairing(docId) {
+            if (!userId) {
+                showStatus('認證尚未準備好,無法刪除。', 'error');
+                return;
+            }
+            
+            try {
+                confirmDialog.style.display = 'none';
+                await getCollectionRef().doc(docId).delete();
+                showStatus(`紀錄 ID: ${docId.substring(0, 5)}... 刪除成功。`, 'success');
+            } catch (error) {
+                console.error("刪除配對錯誤:", error);
+                showStatus('刪除配對失敗,請檢查權限或網路。', 'error');
+            }
+        }
+
+        function renderPairings(pairings) {
+            pairingList.innerHTML = '';
+            if (pairings.length === 0) {
+                pairingList.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-gray-500">尚無配對紀錄。</td></tr>';
+                return;
+            }
+
+            pairings.sort((a, b) => {
+                const aTime = a.timestamp ? a.timestamp.seconds : 0;
+                const bTime = b.timestamp ? b.timestamp.seconds : 0;
+                return bTime - aTime;
+            });
+
+            pairings.forEach(item => {
+                const row = document.createElement('tr');
+                row.className = 'hover:bg-indigo-50 transition duration-100';
+                
+                const isCurrentUser = item.userId === userId;
+                const rowClass = isCurrentUser ? 'font-medium text-indigo-700' : 'text-gray-700';
+
+                row.innerHTML = `
+                    <td class="px-3 py-3 whitespace-nowrap text-sm ${rowClass}">${item.palletId}</td>
+                    <td class="px-3 py-3 whitespace-nowrap text-sm ${rowClass}">${item.locationId}</td>
+                    <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500 hidden sm:table-cell">${formatTimestamp(item.timestamp)}</td>
+                    <td class="px-3 py-3 whitespace-nowrap text-sm font-mono text-gray-400 hidden md:table-cell">${item.userId.substring(0, 8)}...</td>
+                    <td class="px-3 py-3 whitespace-nowrap text-right text-sm font-medium">
+                        <button class="delete-btn text-red-600 hover:text-red-900 transition" data-doc-id="${item.id}" title="刪除此紀錄">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                        </button>
+                    </td>
+                `;
+                pairingList.appendChild(row);
+                
+                lucide.createIcons();
+            });
+            
+            document.querySelectorAll('.delete-btn').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    const docId = e.currentTarget.dataset.docId;
+                    confirmDeleteBtn.dataset.docId = docId;
+                    confirmDialog.style.display = 'flex';
+                });
+            });
+        }
+
+        function startPairingsListener() {
+            if (!db) return;
+            
+            getCollectionRef().onSnapshot((snapshot) => {
+                const pairings = [];
+                snapshot.forEach((doc) => {
+                    pairings.push({ id: doc.id, ...doc.data() });
+                });
+                renderPairings(pairings);
+            }, (error) => {
+                console.error("即時資料監聽錯誤:", error);
+                debugLog('❌ 監聽錯誤: ' + error.message);
+                pairingList.innerHTML = '<tr><td colspan="5" class="py-4 text-center text-red-500">載入錯誤,請檢查網路或權限。</td></tr>';
+            });
+        }
+
+        // --- 條碼掃描功能 ---
+        
+        async function getPreferredDeviceId() {
+            // 檢查 navigator.mediaDevices 是否存在
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                debugLog('❌ 此瀏覽器不支援相機 API 或需要 HTTPS 連線');
+                showStatus('相機功能需要 HTTPS 連線。請使用 HTTPS 或在 localhost 上執行。', 'error');
+                return null;
+            }
+            
+            try {
+                // 請求權限（必要時）
+                await navigator.mediaDevices.getUserMedia({ video: true });
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const videoDevices = devices.filter(device => device.kind === 'videoinput');
+                
+                debugLog(`✅ 找到 ${videoDevices.length} 個相機裝置`);
+                
+                if (videoDevices.length > 0) {
+                    // 優先選擇後置鏡頭（通常包含 "back" 或 "rear" 關鍵字）
+                    const preferred = videoDevices.find(d => {
+                        const label = d.label.toLowerCase();
+                        return label.includes('back') || label.includes('rear') || label.includes('後');
+                    }) || videoDevices[videoDevices.length - 1]; // 如果找不到，選最後一個（通常是後置）
+                    
+                    debugLog(`📷 使用相機: ${preferred.label || '未命名'}`);
+                    return preferred.deviceId;
+                }
+            } catch (error) {
+                console.error("無法列出視訊輸入設備:", error);
+                debugLog('❌ 相機列表錯誤: ' + error.message);
+                return null;
+            }
+            return null;
+        }
+
+        async function startScanner(targetInput) {
+            currentTargetInput = targetInput;
+            scannerContainer.style.display = 'flex';
+            
+            if (!codeReader) {
+                const hints = new Map();
+                hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+                    ZXing.BarcodeFormat.CODE_128,
+                    ZXing.BarcodeFormat.QR_CODE,
+                ]);
+                codeReader = new ZXing.BrowserMultiFormatReader(hints, 500);
+            }
+
+            try {
+                const deviceId = await getPreferredDeviceId();
+                if (!deviceId) {
+                    showStatus('找不到可用的相機。', 'error');
+                    closeScanner();
+                    return;
+                }
+
+                await codeReader.decodeFromVideoDevice(deviceId, 'scanner-video', (result, err) => {
+                    if (result) {
+                        currentTargetInput.value = result.getText();
+                        checkInputs();
+                        closeScanner();
+                    }
+                    if (err && !(err instanceof ZXing.NotFoundException)) {
+                        // 處理其他錯誤
+                    }
+                });
+
+            } catch (error) {
+                console.error('啟動相機錯誤:', error);
+                debugLog('❌ 相機啟動錯誤: ' + error.message);
+                showStatus('無法啟動相機,請檢查權限設定。file:// 協議無法使用相機,請改用 HTTP 伺服器。', 'error');
+                closeScanner();
+            }
+        }
+        
+        function closeScanner() {
+            if (codeReader) {
+                codeReader.reset();
+            }
+            scannerContainer.style.display = 'none';
+        }
+
+        // --- 匯出功能 (CSV) ---
+
+        async function handleExport() {
+            if (!db) {
+                showStatus('資料庫尚未連線。', 'error');
+                return;
+            }
+
+            try {
+                const snapshot = await getCollectionRef().get();
+                const allData = [];
+                snapshot.forEach(doc => {
+                    allData.push({ id: doc.id, ...doc.data() });
+                });
+
+                allData.sort((a, b) => {
+                    const aTime = a.timestamp ? a.timestamp.seconds : 0;
+                    const bTime = b.timestamp ? b.timestamp.seconds : 0;
+                    return bTime - aTime;
+                });
+                
+                if (allData.length === 0) {
+                    showStatus('沒有資料可以匯出。', 'warning');
+                    return;
+                }
+
+                const header = ['棧板 ID', '儲位 ID', '掃描時間', '掃描者 ID'];
+                const csvData = allData.map(item => [
+                    item.palletId,
+                    item.locationId,
+                    item.timestamp ? new Date(item.timestamp.seconds * 1000).toISOString() : '',
+                    item.userId
+                ]);
+
+                let csvContent = header.join(',') + '\n';
+                csvData.forEach(row => {
+                    csvContent += row.map(d => `"${d}"`).join(',') + '\n';
+                });
+
+                const blob = new Blob(['\ufeff', csvContent], { type: 'text/csv;charset=utf-8;' });
+                const today = new Date().toISOString().slice(0, 10);
+                const filename = `pallet_location_pairings_${today}.csv`;
+                
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                showStatus('資料已成功匯出為 CSV 檔案。', 'success');
+
+            } catch (error) {
+                console.error('匯出資料錯誤:', error);
+                showStatus('匯出資料時發生錯誤。', 'error');
+            }
+        }
+        
+        // --- 認證與初始化 ---
+        
+        async function firebaseAuthenticate() {
+            try {
+                debugLog('🔄 開始初始化 Firebase...');
+                app = firebase.initializeApp(firebaseConfig);
+                db = firebase.firestore();
+                auth = firebase.auth();
+                
+                debugLog('🔄 設定持久性...');
+                try {
+                    // 加入超時機制，避免在 file:// 或行動瀏覽器中懸掛
+                    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('設定持久性超時')), 3000));
+                    await Promise.race([auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL), timeout]);
+                    } catch (e) {
+                    debugLog('⚠️ 無法設定持久性（在本地模式被封鎖或超時）: ' + e.message);
+                }
+
+
+                debugLog('🔄 執行匿名登入...');
+                await auth.signInAnonymously();
+                
+                debugLog('✅ Firebase 初始化完成');
+            } catch (error) {
+                console.error("Firebase 認證失敗:", error);
+                const codePart = error && error.code ? (error.code + ' - ') : '';
+                debugLog('❌ Firebase 錯誤: ' + codePart + error.message);
+
+                // 顯示更友善的錯誤訊息到認證區
+                try {
+                    if (error && error.code === 'auth/configuration-not-found') {
+                        authErrorMsg.textContent = 'Firebase 認證設定未找到 (auth/configuration-not-found)。\n請在 Firebase 控制台啟用 Authentication -> Sign-in method，至少啟用匿名登入，並確認 firebaseConfig 值正確。';
+                        authErrorMsg.classList.remove('hidden');
+                    } else {
+                        authErrorMsg.textContent = 'Firebase 連線或登入失敗：' + (error.message || 'Unknown error');
+                        authErrorMsg.classList.remove('hidden');
+                    }
+                } catch (e) {
+                    // 無視 UI 更新錯誤 (在極少數情況下 UI 元素不存在)
+                    console.warn('無法顯示 authErrorMsg：', e);
+                }
+
+                // 將原始錯誤往外丟給呼叫端（保持原有行為）
+                throw error;
+            }
+
+            auth.onAuthStateChanged((user) => {
+                if (user) {
+                    userId = user.uid;
+                    userDisplay.textContent = user.uid;
+                    try {
+                        const savedName = (localStorage.getItem('pallet_scanner_username') || '').trim();
+                        if (savedName) {
+                            userId = savedName;
+                            userDisplay.textContent = userId;
+                        }
+                    } catch (_) {}
+                    debugLog('✅ 使用者已登入: ' + user.uid.substring(0, 8));
+                    startPairingsListener();
+                    
+                    authGate.style.display = 'none';
+                    mainAppContent.classList.remove('hidden');
+                    
+                    showStatus('App 準備就緒,連線到 Firestore 成功。', 'success');
+                } else {
+                    userId = null;
+                    userDisplay.textContent = '未登入';
+                    debugLog('❌ 使用者未登入');
+                    showStatus('使用者未登入,無法存取資料庫。', 'error');
+                }
+            });
+        }
+        
+        async function handleAuthSubmit() {
+            const enteredPassword = authPasswordInput.value;
+            authErrorMsg.classList.add('hidden');
+            
+            debugLog('🔐 檢查密碼...');
+            
+            if (enteredPassword === ACCESS_PASSWORD) {
+                // 保存輸入的使用者名稱（不做稽核）
+                try {
+                    const usernameEl = document.getElementById('access-username');
+                    const enteredUsername = usernameEl ? (usernameEl.value || '').trim() : '';
+                    localStorage.setItem('pallet_scanner_username', enteredUsername);
+                } catch (_) {}
+                authSubmitBtn.disabled = true;
+                authSubmitBtn.textContent = '連線中...';
+                try {
+                    await firebaseAuthenticate();
+                } catch (e) {
+                    authErrorMsg.textContent = e.message;
+                    authErrorMsg.classList.remove('hidden');
+                    authSubmitBtn.disabled = false;
+                    authSubmitBtn.textContent = '進入應用程式';
+                }
+            } else {
+                debugLog('❌ 密碼錯誤');
+                authErrorMsg.textContent = '密碼錯誤,請再試一次。';
+                authErrorMsg.classList.remove('hidden');
+            }
+        }
+
+        function setupEventListeners() {
+            debugLog('🔧 設定事件監聽器...');
+            
+            // 認證門控事件
+            authSubmitBtn.addEventListener('click', handleAuthSubmit);
+            authPasswordInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') handleAuthSubmit();
+            });
+            // 動態建立使用者名稱欄位並綁定事件
+            try {
+                const gateCard = document.querySelector('#auth-gate .card');
+                const passwordEl = document.getElementById('access-password');
+                if (gateCard && passwordEl && !document.getElementById('access-username')) {
+                    const usernameEl = document.createElement('input');
+                    usernameEl.type = 'text';
+                    usernameEl.id = 'access-username';
+                    usernameEl.placeholder = '請輸入使用者名稱';
+                    usernameEl.className = 'w-full p-2 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-center mb-3';
+                    gateCard.insertBefore(usernameEl, passwordEl);
+                }
+                authUsernameInput = document.getElementById('access-username');
+                if (authUsernameInput) {
+                    // 預填上次名稱
+                    try {
+                        const saved = localStorage.getItem('pallet_scanner_username');
+                        if (saved) authUsernameInput.value = saved;
+                    } catch (_) {}
+                    authUsernameInput.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') handleAuthSubmit();
+                    });
+                }
+            } catch (_) {}
+
+            // 輸入事件監聽
+            palletIdInput.addEventListener('input', checkInputs);
+            locationIdInput.addEventListener('input', checkInputs);
+            
+            // 儲存按鈕事件
+            saveBtn.addEventListener('click', savePalletPairing);
+            
+            // 掃描按鈕事件
+            document.getElementById('scan-pallet-btn').addEventListener('click', () => startScanner(palletIdInput));
+            document.getElementById('scan-location-btn').addEventListener('click', () => startScanner(locationIdInput));
+            closeScannerBtn.addEventListener('click', closeScanner);
+            
+            // 匯出按鈕事件
+            document.getElementById('export-csv-btn').addEventListener('click', handleExport);
+            
+            // 刪除確認對話框事件
+            cancelDeleteBtn.addEventListener('click', () => {
+                confirmDialog.style.display = 'none';
+            });
+            confirmDeleteBtn.addEventListener('click', (e) => {
+                const docId = e.currentTarget.dataset.docId;
+                if (docId) {
+                    deletePalletPairing(docId);
+                }
+            });
+            
+            debugLog('✅ 事件監聽器設定完成');
+        }
+
+        // 等待 DOM 完全載入後再執行
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => {
+                setupEventListeners();
+                lucide.createIcons();
+                debugLog('✅ DOM 已載入完成');
+            });
+        } else {
+            setupEventListeners();
+            lucide.createIcons();
+            debugLog('✅ DOM 已載入完成');
+        }
+
+    </script>
+</body>
+</html>
